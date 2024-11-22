@@ -6,7 +6,6 @@ from timm.models import register_model
 from braincog.base.node.node import *
 from braincog.base.encoder.encoder import *
 from braincog.model_zoo.base_module import BaseModule, BaseConvModule
-from braincog.datasets import is_dvs_data
 
 #%%
 @register_model
@@ -24,23 +23,16 @@ class BasicBlock(BaseModule):
 
         self.node = node_type
         if issubclass(self.node, BaseNode):
-            self.node = partial(self.node, **kwargs, step=step)
+            self.node = partial(self.node, layer_by_layer=True, **kwargs, step=step)
 
-        self.dataset = kwargs['dataset'] if 'dataset' in kwargs else 'dvsc10'
-        if not is_dvs_data(self.dataset):
-            init_channel = 3
-        else:
-            init_channel = 2
-        
         self.left = nn.Sequential(
                     BaseConvModule(inchannel, outchannel, kernel_size=3, stride=stride, padding=1, bias=False),
                     nn.BatchNorm2d(outchannel),
-                    nn.ReLU(inplace=True), #inplace=True表示进行原地操作，一般默认为False，表示新建一个变量存储操作
+                    nn.ReLU(inplace=True),
                     BaseConvModule(outchannel, outchannel, kernel_size=3, stride=1, padding=1, bias=False),
                     nn.BatchNorm2d(outchannel)
                 )
         self.shortcut = nn.Sequential()
-        #论文中模型架构的虚线部分，需要下采样
         if stride != 1 or inchannel != outchannel:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(inchannel, outchannel, kernel_size=1, stride=stride, bias=False),
@@ -48,69 +40,61 @@ class BasicBlock(BaseModule):
             )
 
     def forward(self, x):
-        inputs = self.encoder(x)
         self.reset()
-        if self.layer_by_layer:
-            out = self.left(x)
-            out += self.shortcut(x)
-            out = F.relu(out)
-            return out
-        else:
-            outputs = []
-            for t in range(self.step):
-                x = inputs[t]
-                out = self.left(x)
-                out += self.shortcut(x)
-                out = F.relu(out)
-                outputs.append(out)
-            return sum(outputs) / len(outputs)
+        out = self.left(x)
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
 
-#%%
-class ResNet_18(nn.Module):
-    def __init__(self, ResidualBlock, num_classes=10, in_channels=3):
-        super(ResNet_18, self).__init__()
+@register_model
+class ResNet_18(BaseModule):
+    def __init__(self, step, num_classes=10, in_channels=3, *args, **kargs):
+        self.encode_type = 'direct'
+        self.step = step
+        super(ResNet_18, self).__init__(step=step, encode_type=self.encode_type, layer_by_layer=True, temporal_flatten=False)
         self.inchannel = 64
         self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(in_channels, self.inchannel, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(self.inchannel),
             nn.ReLU(),
         )
-        self.layer1 = self.make_layer(ResidualBlock, 64, 2, stride=1)
-        self.layer2 = self.make_layer(ResidualBlock, 128, 2, stride=2)
-        self.layer3 = self.make_layer(ResidualBlock, 256, 2, stride=2)
-        self.layer4 = self.make_layer(ResidualBlock, 512, 2, stride=2)
+        block = BasicBlock
+        self.layer1 = self.make_layer(block, 64, 2, stride=1)
+        self.layer2 = self.make_layer(block, 128, 2, stride=2)
+        self.layer3 = self.make_layer(block, 256, 2, stride=2)
+        self.layer4 = self.make_layer(block, 512, 2, stride=2)
         self.fc = nn.Linear(512, num_classes)
 
     def make_layer(self, block, channels, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)  # strides=[1,1]
         layers = []
         for stride in strides:
-            layers.append(block(self.inchannel, channels, stride))
+            layers.append(block(self.inchannel, channels, stride, step=self.step, encode_type=self.encode_type))
             self.inchannel = channels
         return nn.Sequential(*layers)
 
-    def forward(self, x):  # 3*32*32
-        out = self.conv1(x)  # 64*32*32
-        out = self.layer1(out)  # 64*32*32
-        out = self.layer2(out)  # 128*16*16
-        out = self.layer3(out)  # 256*8*8
-        out = self.layer4(out)  # 512*4*4
-        out = F.avg_pool2d(out, 4)  # 512*1*1
-        out = out.view(out.size(0), -1)  # 512
+    def forward(self, x):
+        x = self.encoder(x)
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
         out = self.fc(out)
+        out = rearrange(out, '(t b) c -> t b c', t=self.step).mean(0)
         return out
     
-#%%
 class TwoStreamSNN(nn.Module):
-    def __init__(self, flow_channels, rgb_channels, num_classes, step, layer_by_layer, node_type, datasets, **kwargs):
+    def __init__(self, flow_channels, rgb_channels, num_classes, step):
         super().__init__()
-        block = partial(BasicBlock, step=step, layer_by_layer=layer_by_layer, node_type=node_type, datasets=datasets)
-        self.rgb_model = ResNet_18(block, 2048, 3)
-        self.flow_model = ResNet_18(block, 2048, 8)
+        self.rgb_model = ResNet_18(step, 512, rgb_channels)
+        self.flow_model = ResNet_18(step, 512, flow_channels)
         self.classifier = nn.Sequential(
-            nn.Linear(2048, 512),
+            nn.Linear(512, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(512, num_classes)
+            nn.Linear(256, num_classes)
         )
 
     def forward(self, rgb, flow):
@@ -122,16 +106,38 @@ class TwoStreamSNN(nn.Module):
         out = self.classifier(out)
         return out
 
-if __name__ == '__main__':
-    # test backbone
-    data = torch.rand(2, 3, 32, 32)
-    lbl = True
-    block = partial(BasicBlock, step=8, layer_by_layer=lbl, node_type=LIFNode, datasets='dvsc10')
-    model = ResNet_18(block, 10)
-    out = model(data)
 
-    # test two stream
-    flow_data = torch.rand(2, 8, 32, 32)
-    rgb_data = torch.rand(2, 3, 32, 32)
-    model = TwoStreamSNN(8, 3, 10, 8, True, LIFNode, 'dvsc10')
+if __name__ == '__main__':
+    pass
+    #%%
+    data = torch.rand(32, 3, 32, 32)
+    model = BasicBlock(3, 8)
+    print(model(data).shape)
+
+    #%%
+    data = torch.rand(32, 8, 3, 32, 32)
+    lbl = True
+    model = ResNet_18(8, 101, 3)
+    out = model(data)
+    print(out.shape)
+
+    #%%
+    # test two stream, 101 classes
+    flow_data = torch.rand(2, 10, 8, 32, 32)
+    rgb_data = torch.rand(2, 10, 3, 32, 32)
+    labels = torch.randint(0, 101, (2,))
+    model = TwoStreamSNN(8, 3, 101, 10)
     out = model(rgb_data, flow_data)
+    print(out.shape)
+    
+    #%%
+    loss = nn.CrossEntropyLoss()
+    opt = torch.optim.Adam(model.parameters(), lr=0.001)
+    for i in range(100):
+        opt.zero_grad()
+        out = model(rgb_data, flow_data)
+        loss_val = loss(out, labels)
+        loss_val.backward()
+        opt.step()
+        print(loss_val.item())
+        break
